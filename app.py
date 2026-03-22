@@ -50,16 +50,15 @@ def fetch(path: str) -> dict:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_all(team_id: int) -> tuple:
+def _fetch_raw(team_id: int) -> tuple:
+    """Single cached fetch of bootstrap + fixtures, shared by all loaders."""
     bootstrap = fetch("/bootstrap-static/")
-    players = {p["id"]: p for p in bootstrap["elements"]}
-    teams = {t["id"]: t for t in bootstrap["teams"]}
-
-    current_gw = next((e["id"] for e in bootstrap["events"] if e["is_current"]), None)
-    next_gw = next((e["id"] for e in bootstrap["events"] if e["is_next"]), None)
-    gw = current_gw or next_gw or 1
-
     raw_fixtures = fetch("/fixtures/?future=1")
+    return bootstrap, raw_fixtures
+
+
+def _build_fixture_map(raw_fixtures: list, teams: dict) -> dict[int, list]:
+    """Build team_id → sorted fixture list (all future GWs, no cap)."""
     team_fixes: dict[int, list] = defaultdict(list)
     for f in raw_fixtures:
         if f.get("event") is None:
@@ -78,58 +77,58 @@ def load_all(team_id: int) -> tuple:
         })
     for tid in team_fixes:
         team_fixes[tid].sort(key=lambda x: x["event"])
+    return dict(team_fixes)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_all(team_id: int) -> tuple:
+    bootstrap, raw_fixtures = _fetch_raw(team_id)
+    players = {p["id"]: p for p in bootstrap["elements"]}
+    teams = {t["id"]: t for t in bootstrap["teams"]}
+
+    current_gw = next((e["id"] for e in bootstrap["events"] if e["is_current"]), None)
+    next_gw = next((e["id"] for e in bootstrap["events"] if e["is_next"]), None)
+    gw = current_gw or next_gw or 1
+
+    team_fixes = _build_fixture_map(raw_fixtures, teams)
+    for tid in team_fixes:
         team_fixes[tid] = team_fixes[tid][:5]
 
     picks_data = fetch(f"/entry/{team_id}/event/{gw}/picks/")
-    return players, teams, gw, dict(team_fixes), picks_data
+    return players, teams, gw, team_fixes, picks_data
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_chip_data(team_id: int) -> tuple:
-    """Fetch all future fixtures (no GW cap) and detect double gameweeks."""
-    bootstrap = fetch("/bootstrap-static/")
-    teams_local = {t["id"]: t for t in bootstrap["teams"]}
+    """All future fixtures (no GW cap) plus double-gameweek detection."""
+    bootstrap, raw_fixtures = _fetch_raw(team_id)
+    teams = {t["id"]: t for t in bootstrap["teams"]}
 
-    raw_fixtures = fetch("/fixtures/?future=1")
-    team_all: dict[int, list] = defaultdict(list)
+    team_all = _build_fixture_map(raw_fixtures, teams)
+
     gw_team_counts: dict[int, dict[int, int]] = {}
-
     for f in raw_fixtures:
         ev = f.get("event")
         if ev is None:
             continue
-        team_all[f["team_h"]].append({
-            "event": ev,
-            "opponent": teams_local[f["team_a"]]["short_name"],
-            "is_home": True,
-            "fdr": f["team_h_difficulty"],
-        })
-        team_all[f["team_a"]].append({
-            "event": ev,
-            "opponent": teams_local[f["team_h"]]["short_name"],
-            "is_home": False,
-            "fdr": f["team_a_difficulty"],
-        })
         if ev not in gw_team_counts:
             gw_team_counts[ev] = {}
         gw_team_counts[ev][f["team_h"]] = gw_team_counts[ev].get(f["team_h"], 0) + 1
         gw_team_counts[ev][f["team_a"]] = gw_team_counts[ev].get(f["team_a"], 0) + 1
 
-    for tid in team_all:
-        team_all[tid].sort(key=lambda x: x["event"])
-
-    double_gws: dict[int, list] = {}
-    for ev, team_counts in gw_team_counts.items():
-        dteams = [
-            teams_local[tid]["short_name"]
-            for tid, cnt in team_counts.items()
-            if cnt >= 2
-        ]
-        if dteams:
-            double_gws[ev] = sorted(dteams)
+    double_gws: dict[int, list] = {
+        ev: sorted(teams[tid]["short_name"] for tid, cnt in team_counts.items() if cnt >= 2)
+        for ev, team_counts in gw_team_counts.items()
+        if any(cnt >= 2 for cnt in team_counts.values())
+    }
 
     remaining_gws = sorted(gw_team_counts.keys())
-    return dict(team_all), double_gws, remaining_gws
+    return team_all, double_gws, remaining_gws
+
+
+@st.cache_resource
+def _groq_client() -> Groq:
+    return Groq(api_key=st.secrets["GROQ_API_KEY"])
 
 
 # ---------------------------------------------------------------------------
@@ -163,27 +162,19 @@ def build_chip_context(
     remaining_gws: list,
     bank: float,
 ) -> dict:
-    """Build a structured dict for the Groq LLM chip analysis."""
     squad_data = []
     for pick in picks:
         p = players.get(pick["element"])
         if not p:
             continue
         team_id = p["team"]
-        player_fixes = all_fixes.get(team_id, [])
-
-        # Build per-GW fixture map (supports double GWs with list of fixtures)
-        gw_fixtures: dict[str, list] = {}
-        for fix in player_fixes:
-            ev = str(fix["event"])
-            if ev not in gw_fixtures:
-                gw_fixtures[ev] = []
-            gw_fixtures[ev].append({
+        gw_fixtures: dict[str, list] = defaultdict(list)
+        for fix in all_fixes.get(team_id, []):
+            gw_fixtures[str(fix["event"])].append({
                 "opponent": fix["opponent"],
                 "home": fix["is_home"],
                 "fdr": fix["fdr"],
             })
-
         squad_data.append({
             "name": p["web_name"],
             "position": POSITION_NAMES.get(p["element_type"], "?"),
@@ -192,7 +183,7 @@ def build_chip_context(
             "form": float(p.get("form") or 0),
             "ict": round(float(p.get("ict_index") or 0), 1),
             "cost": round(p["now_cost"] / 10, 1),
-            "fixtures_by_gw": gw_fixtures,
+            "fixtures_by_gw": dict(gw_fixtures),
         })
 
     return {
@@ -206,14 +197,6 @@ def build_chip_context(
 
 
 def get_chip_recommendations(context: dict) -> dict:
-    """Call Groq LLM and return parsed chip recommendations."""
-    api_key = st.secrets.get("GROQ_API_KEY", "")
-    if not api_key:
-        st.error("GROQ_API_KEY not found in Streamlit secrets.")
-        return {}
-
-    client = Groq(api_key=api_key)
-
     system_prompt = """You are an elite Fantasy Premier League (FPL) analyst specialising in chip strategy.
 
 Analyse the squad and fixture data and recommend the optimal gameweek to use each chip.
@@ -259,7 +242,7 @@ Strategy guidelines:
     )
 
     try:
-        response = client.chat.completions.create(
+        response = _groq_client().chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -269,7 +252,6 @@ Strategy guidelines:
             max_tokens=1200,
         )
         raw = response.choices[0].message.content.strip()
-        # Strip markdown code fences if present
         if "```" in raw:
             parts = raw.split("```")
             raw = parts[1] if len(parts) > 1 else parts[0]
@@ -282,6 +264,17 @@ Strategy guidelines:
     except Exception as e:
         st.error(f"Groq API error: {e}")
         return {}
+
+
+def _chip_card(title: str, rec: dict, extra: list[tuple[str, str]]) -> None:
+    """Render a bordered chip recommendation card."""
+    with st.container(border=True):
+        st.markdown(title)
+        st.markdown(f"**Gameweek:** GW{rec.get('gameweek', '?')}")
+        for label, value in extra:
+            if value:
+                st.markdown(f"**{label}:** {value}")
+        st.info(rec.get("reasoning", "—"))
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +478,6 @@ with tab_chips:
         with st.spinner("Loading all fixtures & consulting AI…"):
             all_fixes, double_gws, remaining_gws = load_chip_data(int(team_id))
 
-            # Show double GW info discovered
             if double_gws:
                 dgw_lines = [
                     f"GW{gw_n}: {', '.join(teams_list)}"
@@ -503,50 +495,31 @@ with tab_chips:
 
     if "chip_recs" in st.session_state:
         recs = st.session_state["chip_recs"]
-
         tc = recs.get("triple_captain", {})
         bb = recs.get("bench_boost", {})
         wc = recs.get("wildcard", {})
         fh = recs.get("free_hit", {})
 
         col_a, col_b = st.columns(2)
-
         with col_a:
-            with st.container(border=True):
-                st.markdown(f"#### 3️⃣ Triple Captain")
-                st.markdown(f"**Gameweek:** GW{tc.get('gameweek', '?')}")
-                st.markdown(f"**Player:** {tc.get('player', '?')}")
-                if tc.get("fixture"):
-                    st.markdown(f"**Fixture:** {tc['fixture']}")
-                st.info(tc.get("reasoning", "—"))
-
+            _chip_card("#### 3️⃣ Triple Captain", tc, [
+                ("Player", tc.get("player", "?")),
+                ("Fixture", tc.get("fixture", "")),
+            ])
         with col_b:
-            with st.container(border=True):
-                st.markdown(f"#### 🔋 Bench Boost")
-                st.markdown(f"**Gameweek:** GW{bb.get('gameweek', '?')}")
-                bench_players = bb.get("key_bench_players", [])
-                if bench_players:
-                    st.markdown(f"**Key bench players:** {', '.join(bench_players)}")
-                st.info(bb.get("reasoning", "—"))
+            _chip_card("#### 🔋 Bench Boost", bb, [
+                ("Key bench players", ", ".join(bb.get("key_bench_players", []))),
+            ])
 
         col_c, col_d = st.columns(2)
-
         with col_c:
-            with st.container(border=True):
-                st.markdown(f"#### 🃏 Wildcard")
-                st.markdown(f"**Gameweek:** GW{wc.get('gameweek', '?')}")
-                if wc.get("strategy"):
-                    st.markdown(f"**Strategy:** {wc['strategy']}")
-                st.info(wc.get("reasoning", "—"))
-
+            _chip_card("#### 🃏 Wildcard", wc, [
+                ("Strategy", wc.get("strategy", "")),
+            ])
         with col_d:
-            with st.container(border=True):
-                st.markdown(f"#### 🎯 Free Hit")
-                st.markdown(f"**Gameweek:** GW{fh.get('gameweek', '?')}")
-                target_teams = fh.get("teams_to_target", [])
-                if target_teams:
-                    st.markdown(f"**Teams to target:** {', '.join(target_teams)}")
-                st.info(fh.get("reasoning", "—"))
+            _chip_card("#### 🎯 Free Hit", fh, [
+                ("Teams to target", ", ".join(fh.get("teams_to_target", []))),
+            ])
     else:
         st.markdown(
             "Click **Analyse my chips** to get AI-powered recommendations "
